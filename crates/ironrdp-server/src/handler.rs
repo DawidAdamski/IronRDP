@@ -164,6 +164,17 @@ impl From<MousePdu> for MouseEvent {
             MouseEvent::VerticalScroll {
                 value: value.number_of_wheel_rotation_units,
             }
+        } else if value.flags.contains(PointerFlags::MIDDLE_BUTTON_OR_WHEEL) {
+            // PTRFLAGS_BUTTON3, MS-RDPBCGR 2.2.8.1.1.3.1.1.3: "Mouse button 3
+            // (middle button or wheel) was clicked or released". Checked after
+            // the wheel flags on purpose: a client that sets both means the
+            // wheel, which takes precedence, and PTRFLAGS_WHEEL has its own
+            // bit (0x0200) distinct from this one.
+            if value.flags.contains(PointerFlags::DOWN) {
+                MouseEvent::MiddlePressed
+            } else {
+                MouseEvent::MiddleReleased
+            }
         } else {
             MouseEvent::Move {
                 x: value.x_position,
