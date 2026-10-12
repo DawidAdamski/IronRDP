@@ -843,9 +843,27 @@ impl Sequence for Acceptor {
 
                         debug!(message = ?capabilities_confirm, "Received");
 
-                        let ShareControlPdu::ClientConfirmActive(confirm) = capabilities_confirm.share_control_pdu
-                        else {
-                            return Err(ConnectorError::general("expected client confirm active"));
+                        let confirm = match capabilities_confirm.share_control_pdu {
+                            ShareControlPdu::ClientConfirmActive(confirm) => confirm,
+                            other => {
+                                // During a Deactivation-Reactivation Sequence
+                                // (MS-RDPBCGR 1.3.1.3) the client keeps sending
+                                // Share Data PDUs it had already queued — Refresh
+                                // Rect and Suppress Output are the common pair,
+                                // sent back to back when a window is restored.
+                                // The specification requires the Confirm Active to
+                                // arrive, not to arrive first, so dropping these is
+                                // the same treatment the two arms above give to
+                                // PDUs that fail to decode. Failing the connection
+                                // here drops the client mid-resize.
+                                if self.reactivation {
+                                    debug!(message = ?other, "Dropping unexpected PDU during reactivation");
+                                    self.state = prev_state;
+                                    return Ok(Written::Nothing);
+                                }
+
+                                return Err(ConnectorError::general("expected client confirm active"));
+                            }
                         };
 
                         (
@@ -927,5 +945,102 @@ fn create_gcc_blocks(
             mcs_message_channel_id: id,
         }),
         multi_transport_channel: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+
+    use ironrdp_core::encode_vec;
+    use ironrdp_pdu::geometry::InclusiveRectangle;
+    use ironrdp_pdu::rdp::headers::ShareDataPdu;
+    use ironrdp_pdu::rdp::refresh_rectangle::RefreshRectanglePdu;
+
+    use super::*;
+
+    /// An acceptor parked in `CapabilitiesWaitConfirm`, as it is right after the
+    /// Demand Active went out.
+    fn waiting_for_confirm(reactivation: bool) -> Acceptor {
+        Acceptor {
+            state: AcceptorState::CapabilitiesWaitConfirm { channels: Vec::new() },
+            security: SecurityProtocol::SSL,
+            io_channel_id: IO_CHANNEL_ID,
+            user_channel_id: USER_CHANNEL_ID,
+            message_channel_id: None,
+            desktop_size: DesktopSize {
+                width: 1920,
+                height: 1080,
+            },
+            keyboard_layout: 0,
+            server_capabilities: Vec::new(),
+            static_channels: StaticChannelSet::new(),
+            saved_for_reactivation: AcceptorState::Consumed,
+            creds: None,
+            received_credentials: None,
+            reactivation,
+            honor_client_desktop_size: false,
+        }
+    }
+
+    /// What a client sends when it restores a window: a Refresh Rect riding the
+    /// I/O channel, decodable and perfectly valid, but not a Confirm Active.
+    fn refresh_rect_from_client() -> Vec<u8> {
+        let share_data = wrap_share_data(
+            ShareDataPdu::RefreshRectangle(RefreshRectanglePdu {
+                areas_to_refresh: vec![InclusiveRectangle {
+                    left: 0,
+                    top: 0,
+                    right: 1919,
+                    bottom: 1079,
+                }],
+            }),
+            USER_CHANNEL_ID,
+        );
+        let user_data = encode_vec(&share_data).unwrap();
+        let request = mcs::SendDataRequest {
+            initiator_id: USER_CHANNEL_ID,
+            channel_id: IO_CHANNEL_ID,
+            user_data: Cow::Owned(user_data),
+        };
+
+        encode_vec(&X224(request)).unwrap()
+    }
+
+    /// During a reactivation such a PDU is dropped and the acceptor keeps
+    /// waiting for the Confirm Active, instead of failing the connection.
+    #[test]
+    fn a_share_data_pdu_during_reactivation_is_dropped() {
+        let mut acceptor = waiting_for_confirm(true);
+        let mut output = WriteBuf::new();
+
+        let written = acceptor
+            .step(&refresh_rect_from_client(), &mut output)
+            .expect("a queued Share Data PDU must not fail the reactivation");
+
+        assert!(matches!(written, Written::Nothing));
+        assert!(output.filled().is_empty(), "nothing is sent in reply");
+        assert!(
+            matches!(acceptor.state, AcceptorState::CapabilitiesWaitConfirm { .. }),
+            "still waiting for the Confirm Active, got {:?}",
+            acceptor.state
+        );
+    }
+
+    /// On a first connection the same PDU is still an error: there is nothing
+    /// in flight that could legitimately arrive before the Confirm Active.
+    #[test]
+    fn a_share_data_pdu_on_a_first_connection_is_an_error() {
+        let mut acceptor = waiting_for_confirm(false);
+        let mut output = WriteBuf::new();
+
+        let error = acceptor
+            .step(&refresh_rect_from_client(), &mut output)
+            .expect_err("expected the connection to fail");
+
+        assert!(
+            error.to_string().contains("expected client confirm active"),
+            "unexpected error: {error}"
+        );
     }
 }

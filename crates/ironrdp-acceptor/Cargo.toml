@@ -14,7 +14,8 @@ categories.workspace = true
 
 [lib]
 doctest = false
-test = false
+# `test = false` would keep the unit tests in connection.rs out of
+# `cargo test --workspace`, which is what CI runs.
 
 [dependencies]
 ironrdp-core = { path = "../ironrdp-core", version = "0.2", features = ["alloc"] } # public
